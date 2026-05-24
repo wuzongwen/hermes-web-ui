@@ -35,6 +35,7 @@ declare module 'koa' {
   interface DefaultState {
     user?: AuthenticatedUser
     profile?: RequestProfile
+    serverTokenAuth?: boolean
   }
 }
 
@@ -67,6 +68,26 @@ function requestToken(ctx: Context): string {
   const auth = ctx.headers.authorization || ''
   if (typeof auth === 'string' && auth.startsWith('Bearer ')) return auth.slice(7).trim()
   return typeof ctx.query.token === 'string' ? ctx.query.token.trim() : ''
+}
+
+const SERVER_TOKEN_MEDIA_PATHS = new Set([
+  '/api/hermes/media/apikey-image-generate',
+  '/api/hermes/media/grok-image-to-video',
+])
+
+async function allowServerTokenForMedia(ctx: Context, token: string): Promise<boolean> {
+  if (!token || !SERVER_TOKEN_MEDIA_PATHS.has(ctx.path)) return false
+  const serverToken = await getToken()
+  if (!serverToken || token !== serverToken) return false
+  ctx.state.serverTokenAuth = true
+  return true
+}
+
+function isProtectedHttpPath(path: string): boolean {
+  const lowerPath = path.toLowerCase()
+  return lowerPath.startsWith('/api') ||
+    lowerPath.startsWith('/v1') ||
+    lowerPath.startsWith('/upload')
 }
 
 export function signUserJwt(user: Pick<UserRecord, 'id' | 'username' | 'role'>, secret: string, now = Date.now()): string {
@@ -140,6 +161,11 @@ export async function isAuthEnabled(): Promise<boolean> {
 }
 
 export async function requireUserJwt(ctx: Context, next: Next): Promise<void> {
+  if (!isProtectedHttpPath(ctx.path)) {
+    await next()
+    return
+  }
+
   const secret = await getJwtSecret()
   if (!secret) {
     await next()
@@ -149,6 +175,10 @@ export async function requireUserJwt(ctx: Context, next: Next): Promise<void> {
   const token = requestToken(ctx)
   const payload = token ? verifyUserJwt(token, secret) : null
   if (!payload) {
+    if (await allowServerTokenForMedia(ctx, token)) {
+      await next()
+      return
+    }
     ctx.status = 401
     ctx.body = { error: 'Unauthorized' }
     return

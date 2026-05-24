@@ -336,6 +336,14 @@ function setItemBestEffort(key: string, value: string) {
   }
 }
 
+function getItemBestEffort(key: string): string | null {
+  try {
+    return localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
 function removeItem(key: string) {
   try {
     localStorage.removeItem(key)
@@ -422,7 +430,7 @@ export const useChatStore = defineStore('chat', () => {
     removeItem(storageKey())
   }
 
-  async function loadSessions(profile?: string | null) {
+  async function loadSessions(profile?: string | null, preferredSessionId?: string | null) {
     isLoadingSessions.value = true
     try {
       const list = await fetchSessions(undefined, undefined, profile || undefined)
@@ -436,11 +444,19 @@ export const useChatStore = defineStore('chat', () => {
       }
       sessions.value = fresh
 
-      // Restore last active session, fallback to most recent
-      const savedId = activeSessionId.value
-      const targetId = savedId && sessions.value.some(s => s.id === savedId)
-        ? savedId
-        : sessions.value[0]?.id
+      // Restore route-selected session first (tab-local source of truth),
+      // then current in-memory session, then persisted legacy/default choice,
+      // then fallback to the most recent session.
+      const currentId = activeSessionId.value
+      const legacyActiveKey = legacyStorageKey()
+      const storedId = getItemBestEffort(storageKey()) || (legacyActiveKey ? getItemBestEffort(LEGACY_STORAGE_KEY) : null)
+      const targetId = preferredSessionId && sessions.value.some(s => s.id === preferredSessionId)
+        ? preferredSessionId
+        : currentId && sessions.value.some(s => s.id === currentId)
+          ? currentId
+          : storedId && sessions.value.some(s => s.id === storedId)
+            ? storedId
+            : sessions.value[0]?.id
       if (targetId) {
         await switchSession(targetId)
       } else {
@@ -459,7 +475,7 @@ export const useChatStore = defineStore('chat', () => {
     const sid = activeSessionId.value
     if (!sid) return false
     try {
-      const detail = await fetchSession(sid)
+      const detail = await fetchSession(sid, activeSession.value?.profile)
       if (!detail) return false
       const target = sessions.value.find(s => s.id === sid)
       if (!target) return false
@@ -533,6 +549,15 @@ export const useChatStore = defineStore('chat', () => {
         const timeout = setTimeout(() => reject(new Error('resume timeout')), 15_000)
         resumeSession(sessionId, (data) => {
           clearTimeout(timeout)
+          if (data.session_id !== sessionId || activeSessionId.value !== sessionId) {
+            resolve()
+            return
+          }
+          const target = sessions.value.find(s => s.id === sessionId)
+          if (!target) {
+            resolve()
+            return
+          }
           if (data.isWorking) {
             serverWorking.value.add(sessionId)
           } else {
@@ -553,19 +578,20 @@ export const useChatStore = defineStore('chat', () => {
           } else if (!data.isWorking) {
             setAbortState(null)
           }
-          if (data.inputTokens != null) activeSession.value!.inputTokens = data.inputTokens
-          if (data.outputTokens != null) activeSession.value!.outputTokens = data.outputTokens
-          if ((data as any).contextTokens != null) activeSession.value!.contextTokens = (data as any).contextTokens
+          if (data.inputTokens != null) target.inputTokens = data.inputTokens
+          if (data.outputTokens != null) target.outputTokens = data.outputTokens
+          if ((data as any).contextTokens != null) target.contextTokens = (data as any).contextTokens
           if (data.messages?.length) {
-            activeSession.value!.messages = mapHermesMessages(data.messages as any[])
+            target.messages = mapHermesMessages(data.messages as any[])
           }
-          if (!activeSession.value!.title) {
-            const firstUser = activeSession.value!.messages.find(m => m.role === 'user')
+          if (!target.title) {
+            const firstUser = target.messages.find(m => m.role === 'user')
             if (firstUser) {
               const t = firstUser.content.slice(0, 40)
-              activeSession.value!.title = t + (firstUser.content.length > 40 ? '...' : '')
+              target.title = t + (firstUser.content.length > 40 ? '...' : '')
             }
           }
+          activeSession.value = target
           // Process replayed events (compression state etc.)
           if (data.events?.length) {
             for (const evt of data.events) {
@@ -588,7 +614,7 @@ export const useChatStore = defineStore('chat', () => {
                   compressed: e.compressed ?? false,
                   error: e.error,
                 })
-                if (e.contextTokens != null) activeSession.value!.contextTokens = e.contextTokens
+                if (e.contextTokens != null) target.contextTokens = e.contextTokens
               } else if (e.event === 'abort.started') {
                 setAbortState({ aborting: true, synced: null })
               } else if (e.event === 'abort.completed') {
@@ -641,11 +667,13 @@ export const useChatStore = defineStore('chat', () => {
                     toolResult: output,
                   })
                 }
+              } else if (String(e.event || '').startsWith('subagent.')) {
+                handleSubagentEvent(sessionId, e as RunEvent)
               }
             }
           }
           resolve()
-        })
+        }, activeSession.value?.profile)
       })
     } catch (err) {
       console.error('Failed to load session messages via resume:', err)
@@ -654,17 +682,20 @@ export const useChatStore = defineStore('chat', () => {
     }
 
     // Resume in-flight run event listeners if needed
-    resumeServerWorkingRun(sessionId)
+    if (activeSessionId.value === sessionId) {
+      resumeServerWorkingRun(sessionId)
+    }
   }
 
-  function newChat(options: { profile?: string; model?: string; provider?: string } = {}) {
+  function newChat(options: { profile?: string; model?: string; provider?: string } = {}): Session {
     const appStore = useAppStore()
     const session = createSession({
       profile: options.profile,
       model: options.model || appStore.selectedModel || undefined,
       provider: options.provider || appStore.selectedProvider || '',
     })
-    switchSession(session.id)
+    void switchSession(session.id)
+    return session
   }
 
   async function switchSessionModel(modelId: string, provider?: string, sessionId?: string): Promise<boolean> {
@@ -685,7 +716,8 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   async function deleteSession(sessionId: string) {
-    await deleteSessionApi(sessionId)
+    const target = sessions.value.find(s => s.id === sessionId)
+    await deleteSessionApi(sessionId, target?.profile)
     sessions.value = sessions.value.filter(s => s.id !== sessionId)
     if (activeSessionId.value === sessionId) {
       if (sessions.value.length > 0) {
@@ -725,6 +757,71 @@ export const useChatStore = defineStore('chat', () => {
     if (idx !== -1) {
       s.messages[idx] = { ...s.messages[idx], ...update }
     }
+  }
+
+  function handleSubagentEvent(sessionId: string, evt: RunEvent) {
+    const eventName = String(evt.event || '')
+    if (!eventName.startsWith('subagent.')) return
+
+    const subagentId = String((evt as any).subagent_id || `${(evt as any).task_index ?? 0}`)
+    const toolCallId = `subagent:${evt.run_id || 'run'}:${subagentId}`
+    const taskIndex = Number((evt as any).task_index ?? 0)
+    const taskCount = Number((evt as any).task_count ?? 1)
+    const label = `${taskIndex + 1}/${Math.max(1, taskCount || 1)}`
+    const toolName = String((evt as any).tool || (evt as any).name || '')
+    const toolCount = Number((evt as any).tool_count || 0)
+    const goal = String((evt as any).goal || '').trim()
+    const text = String(evt.text || evt.preview || '').trim()
+    const summary = String((evt as any).summary || '').trim()
+    const duration = Number((evt as any).duration_seconds ?? (evt as any).duration)
+
+    let preview = text || summary || goal
+    if (eventName === 'subagent.start') {
+      preview = `subagent ${label} started${goal ? `: ${goal}` : ''}`
+    } else if (eventName === 'subagent.tool') {
+      const prefix = `subagent ${label}${toolCount ? ` turn ${toolCount}` : ''}`
+      preview = `${prefix}${toolName ? `: ${toolName}` : ''}${text ? ` - ${text}` : ''}`
+    } else if (eventName === 'subagent.progress') {
+      preview = `subagent ${label}: ${text || 'working'}`
+    } else if (eventName === 'subagent.complete') {
+      const status = String((evt as any).status || 'completed')
+      preview = `subagent ${label} ${status}${summary ? `: ${summary}` : ''}`
+    }
+
+    const msgs = getSessionMsgs(sessionId)
+    const existing = msgs.find(m => m.role === 'tool' && m.toolCallId === toolCallId)
+    const toolStatus = eventName === 'subagent.complete'
+      ? ((evt as any).status && String((evt as any).status) !== 'completed' ? 'error' : 'done')
+      : 'running'
+    const update: Partial<Message> = {
+      toolName: 'delegate_task',
+      toolCallId,
+      toolPreview: preview.slice(0, 220),
+      toolStatus,
+      toolDuration: Number.isFinite(duration) ? duration : undefined,
+      toolResult: eventName === 'subagent.complete'
+        ? JSON.stringify({
+            status: (evt as any).status || 'completed',
+            summary: summary || text,
+            api_calls: (evt as any).api_calls,
+            input_tokens: (evt as any).input_tokens,
+            output_tokens: (evt as any).output_tokens,
+          }, null, 2)
+        : undefined,
+    }
+
+    if (existing) {
+      updateMessage(sessionId, existing.id, update)
+      return
+    }
+
+    addMessage(sessionId, {
+      id: uid(),
+      role: 'tool',
+      content: '',
+      timestamp: Date.now(),
+      ...update,
+    })
   }
 
   function addAgentErrorMessage(sessionId: string, error?: string | null) {
@@ -1078,7 +1175,7 @@ export const useChatStore = defineStore('chat', () => {
       const runPayload = {
         input,
         session_id: sid,
-        profile: shouldSendInitialSessionConfig ? activeSession.value?.profile || undefined : undefined,
+        profile: activeSession.value?.profile || useProfilesStore().activeProfileName || undefined,
         model: shouldSendInitialSessionConfig ? sessionModel || undefined : undefined,
         provider: shouldSendInitialSessionConfig ? sessionProvider || undefined : undefined,
         model_groups: appStore.modelGroups.map(group => ({
@@ -1350,6 +1447,15 @@ export const useChatStore = defineStore('chat', () => {
                 })
               }
 
+              break
+            }
+
+            case 'subagent.start':
+            case 'subagent.tool':
+            case 'subagent.progress':
+            case 'subagent.complete': {
+              runHadToolActivity = true
+              handleSubagentEvent(sid, evt)
               break
             }
 
@@ -1794,6 +1900,15 @@ export const useChatStore = defineStore('chat', () => {
           break
         }
 
+        case 'subagent.start':
+        case 'subagent.tool':
+        case 'subagent.progress':
+        case 'subagent.complete': {
+          runHadToolActivity = true
+          handleSubagentEvent(sid, evt)
+          break
+        }
+
         case 'approval.requested': {
           setPendingApproval(evt)
           break
@@ -1941,6 +2056,7 @@ export const useChatStore = defineStore('chat', () => {
       onReasoningAvailable: (evt) => handleEvent(evt),
       onToolStarted: (evt) => handleEvent(evt),
       onToolCompleted: (evt) => handleEvent(evt),
+      onSubagentEvent: (evt) => handleEvent(evt),
       onRunStarted: (evt) => handleEvent(evt),
       onRunCompleted: (evt) => handleEvent(evt),
       onRunFailed: (evt) => handleEvent(evt),
@@ -2054,7 +2170,7 @@ export const useChatStore = defineStore('chat', () => {
               activeSession.value.messages = mapHermesMessages(data.messages as any[])
             }
             resumeServerWorkingRun(sid)
-          })
+          }, activeSession.value?.profile)
         }
       }
     })
