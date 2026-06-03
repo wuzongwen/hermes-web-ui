@@ -38,6 +38,7 @@ const { t } = useI18n();
 const showDrawer = ref(false);
 const drawerActiveTab = ref<"terminal" | "files">("files");
 const showOutline = ref(false);
+const messageListRef = ref<InstanceType<typeof MessageList> | null>(null);
 
 const currentMode = ref<"chat" | "live">("chat");
 
@@ -70,6 +71,10 @@ function sessionHref(sessionId: string) {
 function openSessionInNewTab(sessionId: string) {
   if (typeof window === "undefined") return;
   window.open(sessionHref(sessionId), "_blank", "noopener,noreferrer");
+}
+
+function handleOutlineNavigate(target: { messageId: string; anchorId: string }) {
+  messageListRef.value?.scrollToAnchor(target.messageId, target.anchorId);
 }
 
 async function handleSessionClick(sessionId: string) {
@@ -1201,9 +1206,13 @@ async function handleSessionModelCustomSubmit() {
       <template v-if="currentMode === 'chat'">
         <div class="chat-content-wrapper">
           <div class="chat-main-content">
-            <MessageList />
+            <MessageList ref="messageListRef" />
           </div>
-          <OutlinePanel v-if="showOutline" :messages="chatStore.messages" />
+          <OutlinePanel
+            v-if="showOutline"
+            :messages="chatStore.messages"
+            @navigate="handleOutlineNavigate"
+          />
         </div>
         <div v-if="visibleApproval" class="approval-bar">
           <div class="approval-icon" aria-hidden="true">
@@ -1307,13 +1316,12 @@ async function handleSessionModelCustomSubmit() {
                 {{ t('chat.clarifyDismiss') }}
               </NButton>
             </div>
-            <div v-else class="clarify-actions">
+            <div v-else class="clarify-actions clarify-actions-open">
               <div class="clarify-input-row">
                 <NInput
                   v-model:value="clarifyResponse"
                   size="small"
                   :placeholder="t('chat.clarifyPlaceholder')"
-                  @keyup.enter="handleClarify()"
                 />
                 <NButton size="small" type="primary" @click="handleClarify()">
                   {{ t('chat.clarifySubmit') }}
@@ -2168,12 +2176,24 @@ async function handleSessionModelCustomSubmit() {
 .clarify-input-row {
   display: flex;
   flex: 1;
+  width: 100%;
+  min-width: 0;
   gap: 8px;
   align-items: center;
 
-  .n-input {
-    flex: 1;
+  :deep(.n-input) {
+    flex: 1 1 auto;
+    min-width: 0;
   }
+
+  :deep(.n-button) {
+    flex: 0 0 auto;
+  }
+}
+
+.clarify-actions-open {
+  display: flex;
+  width: 100%;
 }
 @media (max-width: 768px) {
   .approval-bar {
@@ -2212,8 +2232,17 @@ async function handleSessionModelCustomSubmit() {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .clarify-actions-open {
+    display: flex;
+    grid-template-columns: none;
+  }
+
   .clarify-actions :deep(.n-button) {
     width: 100%;
+  }
+
+  .clarify-actions-open :deep(.n-button) {
+    width: auto;
   }
 }
 
@@ -2232,6 +2261,15 @@ async function handleSessionModelCustomSubmit() {
 
   .clarify-actions {
     grid-template-columns: 1fr;
+  }
+
+  .clarify-input-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .clarify-actions-open :deep(.n-button) {
+    width: 100%;
   }
 }
 

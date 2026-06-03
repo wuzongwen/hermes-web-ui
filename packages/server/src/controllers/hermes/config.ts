@@ -1,7 +1,6 @@
 import { readFile } from 'fs/promises'
 import { join } from 'path'
 import { getActiveProfileName, getProfileDir } from '../../services/hermes/hermes-profile'
-import { AgentBridgeClient } from '../../services/hermes/agent-bridge'
 import { restartGatewayForProfile } from '../../services/hermes/gateway-autostart'
 import { saveEnvValueForProfile } from '../../services/config-helpers'
 import { logger } from '../../services/logger'
@@ -14,7 +13,15 @@ const PLATFORM_SECTIONS = new Set([
 ])
 
 function requestedProfile(ctx: any): string {
-  return ctx.state?.profile?.name || getActiveProfileName() || 'default'
+  const headerProfile = typeof ctx.get === 'function' ? ctx.get('x-hermes-profile') : ''
+  const queryProfile = typeof ctx.query?.profile === 'string' ? ctx.query.profile : ''
+  const bodyProfile = typeof ctx.request?.body?.profile === 'string' ? ctx.request.body.profile : ''
+  return ctx.state?.profile?.name ||
+    headerProfile.trim() ||
+    queryProfile.trim() ||
+    bodyProfile.trim() ||
+    getActiveProfileName() ||
+    'default'
 }
 
 const configPath = (profile: string) => join(getProfileDir(profile), 'config.yaml')
@@ -31,6 +38,7 @@ const envPlatformMap: Record<string, [string, string]> = {
   DINGTALK_CLIENT_ID: ['dingtalk', 'extra.client_id'],
   DINGTALK_CLIENT_SECRET: ['dingtalk', 'extra.client_secret'],
   DINGTALK_APP_KEY: ['dingtalk', 'extra.app_key'],
+  DINGTALK_CARD_TEMPLATE_ID: ['dingtalk', 'extra.card_template_id'],
   DINGTALK_ALLOWED_USERS: ['dingtalk', 'allowed_users'],
   DINGTALK_ALLOW_ALL_USERS: ['dingtalk', 'allow_all_users'],
   QQ_APP_ID: ['qqbot', 'extra.app_id'],
@@ -84,13 +92,70 @@ function deepMerge(target: Record<string, any>, source: Record<string, any>): Re
   return target
 }
 
-async function destroyBridgeProfile(profile: string): Promise<void> {
-  try {
-    const result = await new AgentBridgeClient({ connectRetryMs: 0, timeoutMs: 5000 }).destroyProfile(profile)
-    logger.info('[config] destroyed bridge sessions after gateway restart profile=%s destroyed=%s', profile, result.destroyed)
-  } catch (err) {
-    logger.warn(err, '[config] failed to destroy bridge sessions after gateway restart profile=%s', profile)
+const AUXILIARY_TASKS = [
+  { key: 'vision', label: 'Vision', default_timeout: 120, default_download_timeout: 30 },
+  { key: 'web_extract', label: 'Web extract', default_timeout: 360 },
+  { key: 'compression', label: 'Compression', default_timeout: 120 },
+  { key: 'skills_hub', label: 'Skills hub', default_timeout: 30 },
+  { key: 'approval', label: 'Approval', default_timeout: 30 },
+  { key: 'mcp', label: 'MCP', default_timeout: 30 },
+  { key: 'title_generation', label: 'Title generation', default_timeout: 30 },
+  { key: 'triage_specifier', label: 'Triage specifier', default_timeout: 120 },
+  { key: 'kanban_decomposer', label: 'Kanban decomposer', default_timeout: 180 },
+  { key: 'profile_describer', label: 'Profile describer', default_timeout: 60 },
+  { key: 'curator', label: 'Curator', default_timeout: 600 },
+  { key: 'session_search', label: 'Session search', default_timeout: 30 },
+  { key: 'flush_memories', label: 'Flush memories', default_timeout: 30 },
+] as const
+
+const AUX_STRING_FIELDS = new Set(['provider', 'model', 'base_url', 'api_key'])
+const AUX_NUMBER_FIELDS = new Set(['timeout', 'download_timeout'])
+
+function isPlainRecord(value: unknown): value is Record<string, any> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isSafeAuxiliaryKey(value: string): boolean {
+  return /^[A-Za-z0-9_.-]{1,80}$/.test(value) &&
+    value !== '__proto__' &&
+    value !== 'prototype' &&
+    value !== 'constructor'
+}
+
+function normalizeAuxiliaryConfig(value: unknown, options: { resetAuto?: boolean } = {}): Record<string, any> {
+  if (!isPlainRecord(value)) return {}
+  const normalized: Record<string, any> = {}
+
+  for (const [task, rawSettings] of Object.entries(value)) {
+    if (!isSafeAuxiliaryKey(task) || !isPlainRecord(rawSettings)) continue
+    const settings: Record<string, any> = {}
+    const provider = typeof rawSettings.provider === 'string' ? rawSettings.provider.trim() : ''
+    const resetToAuto = options.resetAuto === true && provider === 'auto'
+
+    for (const [field, rawValue] of Object.entries(rawSettings)) {
+      if (resetToAuto && field !== 'provider' && field !== 'timeout' && field !== 'download_timeout') continue
+      if (AUX_STRING_FIELDS.has(field)) {
+        if (typeof rawValue !== 'string') continue
+        const trimmed = rawValue.trim()
+        if (trimmed) settings[field] = trimmed
+      } else if (AUX_NUMBER_FIELDS.has(field)) {
+        if (field === 'download_timeout' && task !== 'vision') continue
+        if (rawValue === null || rawValue === undefined || rawValue === '') continue
+        const numberValue = Number(rawValue)
+        if (Number.isFinite(numberValue) && numberValue > 0) {
+          settings[field] = Math.floor(numberValue)
+        }
+      } else if (field === 'extra_body') {
+        if (isPlainRecord(rawValue) && Object.keys(rawValue).length > 0) {
+          settings.extra_body = rawValue
+        }
+      }
+    }
+
+    if (Object.keys(settings).length > 0) normalized[task] = settings
   }
+
+  return normalized
 }
 
 async function readEnvPlatforms(profile: string): Promise<Record<string, any>> {
@@ -159,13 +224,12 @@ export async function updateConfig(ctx: any) {
       },
     })
 
-    // Platform adapters still run through Hermes gateway; restart it so channel
-    // config changes (Feishu/Weixin/etc.) are applied, then refresh bridge sessions.
+    // Platform adapters run through Hermes gateway; restart it so channel
+    // config changes (Feishu/Weixin/etc.) are applied.
     if (restart !== false && PLATFORM_SECTIONS.has(section)) {
       try {
         const restartResult = await restartGatewayForProfile(profile)
         logger.info('[config] gateway restarted after config update section=%s profile=%s result=%j', section, profile, restartResult)
-        await destroyBridgeProfile(profile)
       } catch (err) {
         logger.error(err, 'Gateway restart failed')
         ctx.status = 500
@@ -177,6 +241,48 @@ export async function updateConfig(ctx: any) {
     ctx.body = { success: true }
   } catch (err: any) {
     ctx.status = 500; ctx.body = { error: err.message }
+  }
+}
+
+export async function getAuxiliaryModels(ctx: any) {
+  try {
+    const profile = requestedProfile(ctx)
+    const config = await readConfig(profile)
+    ctx.body = {
+      tasks: AUXILIARY_TASKS,
+      auxiliary: normalizeAuxiliaryConfig(config.auxiliary),
+    }
+  } catch (err: any) {
+    ctx.status = 500
+    ctx.body = { error: err.message }
+  }
+}
+
+export async function updateAuxiliaryModels(ctx: any) {
+  const body = ctx.request.body as { auxiliary?: unknown }
+  if (!body || !isPlainRecord(body.auxiliary)) {
+    ctx.status = 400
+    ctx.body = { error: 'Missing auxiliary config' }
+    return
+  }
+
+  try {
+    const profile = requestedProfile(ctx)
+    const auxiliary = normalizeAuxiliaryConfig(body.auxiliary, { resetAuto: true })
+    await safeFileStore.updateYaml(configPath(profile), (config) => {
+      if (Object.keys(auxiliary).length > 0) config.auxiliary = auxiliary
+      else delete config.auxiliary
+      return config
+    }, {
+      backup: true,
+      dumpOptions: {
+        forceQuotes: true,
+      },
+    })
+    ctx.body = { success: true, auxiliary }
+  } catch (err: any) {
+    ctx.status = 500
+    ctx.body = { error: err.message }
   }
 }
 
@@ -227,12 +333,11 @@ export async function updateCredentials(ctx: any) {
       },
     })
 
-    // Platform adapters still run through Hermes gateway; restart it so channel
-    // credentials are applied, then refresh bridge sessions.
+    // Platform adapters run through Hermes gateway; restart it so channel
+    // credentials are applied.
     try {
       const restartResult = await restartGatewayForProfile(profile)
       logger.info('[config] gateway restarted after credentials update platform=%s profile=%s result=%j', platform, profile, restartResult)
-      await destroyBridgeProfile(profile)
     } catch (err) {
       logger.error(err, 'Gateway restart failed')
       ctx.status = 500

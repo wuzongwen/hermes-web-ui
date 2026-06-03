@@ -28,6 +28,9 @@ export interface SessionMessage {
 export interface QueuedRun {
   queue_id: string
   input: string | ContentBlock[]
+  displayInput?: string | ContentBlock[] | null
+  displayRole?: 'user' | 'command'
+  storageMessage?: string
   model?: string
   provider?: string
   model_groups?: Array<{ provider: string; models: string[] }>
@@ -35,10 +38,15 @@ export interface QueuedRun {
   profile: string
   source?: ChatRunSource
   originSocketId?: string
+  goalContinuation?: boolean
 }
 
 export interface SessionState {
   messages: SessionMessage[]
+  messageTotal?: number
+  messageLoadedCount?: number
+  messagePageLimit?: number
+  hasMoreBefore?: boolean
   isWorking: boolean
   events: Array<{ event: string; data: any }>
   abortController?: AbortController
